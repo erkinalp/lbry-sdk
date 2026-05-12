@@ -48,6 +48,7 @@ setup(
         'coincurve==20.0.0',
         'pbkdf2==1.3',
         'filetype==1.2.0',
+        'pycryptodome>=3.9.0',
         # setuptools provides pkg_resources, needed for version comparison
         'setuptools>=70.0.0',
     ],

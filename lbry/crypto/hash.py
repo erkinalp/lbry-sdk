@@ -16,14 +16,14 @@ def sha512(x):
 def ripemd160(x):
     """ Simple wrapper of hashlib ripemd160. """
     try:
-        h = hashlib.new('ripemd160')
-    except ValueError as e:
-        raise RuntimeError(
-            "Your Python/OpenSSL installation does not support RIPEMD160. "
-            "Try reinstalling Python with full OpenSSL support."
-        ) from e
-    h.update(x)
-    return h.digest()
+        h = hashlib.new('ripemd160', usedforsecurity=False)
+        h.update(x)
+        return h.digest()
+    except (ValueError, TypeError):
+        # ValueError: OpenSSL 3.x may not support ripemd160
+        # TypeError: Python <3.9 doesn't support usedforsecurity kwarg
+        from Crypto.Hash import RIPEMD160  # pylint: disable=import-outside-toplevel
+        return RIPEMD160.new(x).digest()
 
 
 

@@ -139,92 +139,46 @@ class MarketFeed:
         return self._consecutive_failures
 
 
-class BaseBittrexFeed(MarketFeed):
-    name = "Bittrex"
-    market = None
-    url = None
-    fee = 0.0025
-
-    def get_rate_from_response(self, json_response):
-        if 'lastTradeRate' not in json_response:
-            raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response['lastTradeRate'])
-
-
-class BittrexBTCFeed(BaseBittrexFeed):
-    market = "BTCLBC"
-    url = "https://api.bittrex.com/v3/markets/LBC-BTC/ticker"
-
-
-class BittrexUSDFeed(BaseBittrexFeed):
+class MEXCFeed(MarketFeed):
+    name = "MEXC"
     market = "USDLBC"
-    url = "https://api.bittrex.com/v3/markets/LBC-USD/ticker"
-
-
-class BaseCoinExFeed(MarketFeed):
-    name = "CoinEx"
-    market = None
-    url = None
+    url = "https://api.mexc.com/api/v3/ticker/price"
+    params = {"symbol": "LBCUSDT"}
 
     def get_rate_from_response(self, json_response):
-        if 'data' not in json_response or \
-           'ticker' not in json_response['data'] or \
-           'last' not in json_response['data']['ticker']:
+        if 'price' not in json_response:
             raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response['data']['ticker']['last'])
+        return 1.0 / float(json_response['price'])
 
 
-class CoinExBTCFeed(BaseCoinExFeed):
-    market = "BTCLBC"
-    url = "https://api.coinex.com/v1/market/ticker?market=LBCBTC"
-
-
-class CoinExUSDFeed(BaseCoinExFeed):
+class CoinGeckoUSDFeed(MarketFeed):
+    name = "CoinGecko"
     market = "USDLBC"
-    url = "https://api.coinex.com/v1/market/ticker?market=LBCUSDT"
-
-
-class BaseHotbitFeed(MarketFeed):
-    name = "hotbit"
-    market = None
-    url = "https://api.hotbit.io/api/v1/market.last"
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "lbry-credits", "vs_currencies": "usd"}
 
     def get_rate_from_response(self, json_response):
-        if 'result' not in json_response:
+        if 'lbry-credits' not in json_response or 'usd' not in json_response['lbry-credits']:
             raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response['result'])
+        return 1.0 / float(json_response['lbry-credits']['usd'])
 
 
-class HotbitBTCFeed(BaseHotbitFeed):
+class CoinGeckoBTCFeed(MarketFeed):
+    name = "CoinGecko"
     market = "BTCLBC"
-    params = {"market": "LBC/BTC"}
-
-
-class HotbitUSDFeed(BaseHotbitFeed):
-    market = "USDLBC"
-    params = {"market": "LBC/USDT"}
-
-
-class UPbitBTCFeed(MarketFeed):
-    name = "UPbit"
-    market = "BTCLBC"
-    url = "https://api.upbit.com/v1/ticker"
-    params = {"markets": "BTC-LBC"}
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "lbry-credits", "vs_currencies": "btc"}
 
     def get_rate_from_response(self, json_response):
-        if "error" in json_response or len(json_response) != 1 or 'trade_price' not in json_response[0]:
+        if 'lbry-credits' not in json_response or 'btc' not in json_response['lbry-credits']:
             raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response[0]['trade_price'])
+        return 1.0 / float(json_response['lbry-credits']['btc'])
 
 
 FEEDS: Iterable[Type[MarketFeed]] = (
-    BittrexBTCFeed,
-    BittrexUSDFeed,
-    CoinExBTCFeed,
-    CoinExUSDFeed,
-#    HotbitBTCFeed,
-#    HotbitUSDFeed,
-#    UPbitBTCFeed,
+    MEXCFeed,
+    CoinGeckoUSDFeed,
+    CoinGeckoBTCFeed,
 )
 
 
