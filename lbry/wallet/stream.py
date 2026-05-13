@@ -69,8 +69,7 @@ class StreamController:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop, create a future manually
-            loop = asyncio.new_event_loop()
+            loop = asyncio.get_event_loop()
         for subscription in self._iterate_subscriptions:
             maybe_coroutine = notify(subscription)
             if asyncio.iscoroutine(maybe_coroutine):
