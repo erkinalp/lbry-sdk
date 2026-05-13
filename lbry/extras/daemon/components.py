@@ -555,7 +555,7 @@ class TorrentComponent(Component):
         except Exception as err:  # pylint: disable=broad-except
             log.warning("Torrent support not available, skipping libtorrent component: %s", err)
             return
-        self.torrent_session = TorrentSession(asyncio.get_event_loop(), None)
+        self.torrent_session = TorrentSession(asyncio.get_running_loop(), None)
         await self.torrent_session.bind()  # TODO: specify host/port
 
     async def stop(self):
