@@ -10,6 +10,7 @@ import typing
 import random
 import tracemalloc
 import itertools
+import string
 from urllib.parse import urlencode, quote
 from typing import Callable, Optional, List
 from binascii import hexlify, unhexlify
@@ -33,6 +34,8 @@ from lbry.crypto.base58 import Base58
 from lbry import utils
 from lbry.conf import Config, Setting, NOT_SET
 from lbry.blob.blob_file import is_valid_blobhash, BlobBuffer
+from lbry.stream.descriptor import StreamDescriptor, InvalidStreamDescriptorError
+from lbry.stream.managed_stream import ManagedStream
 from lbry.blob_exchange.downloader import download_blob
 from lbry.dht.peer import make_kademlia_peer
 from lbry.error import (
@@ -840,7 +843,11 @@ class Daemon(metaclass=JSONRPCServerType):
             raise web.GracefulExit()
 
         log.info("Shutting down lbrynet daemon")
-        asyncio.get_event_loop().call_later(0, shutdown)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        loop.call_later(0, shutdown)
         return "Shutting down"
 
     async def jsonrpc_ffmpeg_find(self):
@@ -1011,11 +1018,17 @@ class Daemon(metaclass=JSONRPCServerType):
                     [--include_sent_tips]
                     [--include_received_tips]
                     [--new_sdk_server=<new_sdk_server>]
+                    [--cycle_hubs]
+                    [--cycle_on_blocked]
+                    [--max_hub_cycles=<n>]
 
         Options:
             --urls=<urls>              : (str, list) one or more urls to resolve
-            --wallet_id=<wallet_id>    : (str) wallet to check for claim purchase receipts
+           --wallet_id=<wallet_id>    : (str) wallet to check for claim purchase receipts
            --new_sdk_server=<new_sdk_server> : (str) URL of the new SDK server (EXPERIMENTAL)
+           --cycle_hubs               : (bool) try alternate wallet servers for NOT_FOUND results
+           --cycle_on_blocked         : (bool) also retry on BLOCKED results (censored on a hub)
+           --max_hub_cycles=<n>       : (int) limit the number of alternate hubs to try
            --include_purchase_receipt  : (bool) lookup and include a receipt if this wallet
                                                 has purchased the claim being resolved
             --include_is_my_output     : (bool) lookup and include a boolean indicating
@@ -1378,9 +1391,7 @@ class Daemon(metaclass=JSONRPCServerType):
             await new_account.maybe_migrate_certificates()
         if added_accounts and self.ledger.network.is_connected:
             if blocking:
-                await asyncio.wait([
-                    a.ledger.subscribe_account(a) for a in added_accounts
-                ])
+                await asyncio.gather(*(a.ledger.subscribe_account(a) for a in added_accounts))
             else:
                 for new_account in added_accounts:
                     asyncio.create_task(self.ledger.subscribe_account(new_account))
@@ -1996,9 +2007,7 @@ class Daemon(metaclass=JSONRPCServerType):
                 await new_account.maybe_migrate_certificates()
             if added_accounts and self.ledger.network.is_connected:
                 if blocking:
-                    await asyncio.wait([
-                        a.ledger.subscribe_account(a) for a in added_accounts
-                    ])
+                    await asyncio.gather(*(a.ledger.subscribe_account(a) for a in added_accounts))
                 else:
                     for new_account in added_accounts:
                         asyncio.create_task(self.ledger.subscribe_account(new_account))
@@ -4909,6 +4918,220 @@ class Daemon(metaclass=JSONRPCServerType):
     Blob management.
     """
 
+    STORAGE_DOC = """
+    Storage inventory and pinning.
+
+    Commands:
+      - inventory: Summarize storage usage and per-claim details.
+      - map: Show blobs for a specific claim/stream.
+      - pin: Protect a claim's blobs from cleanup.
+      - unpin: Remove protection so cleanup can evict.
+      - pins: List pinned claims.
+    """
+
+    @requires(DATABASE_COMPONENT)
+    async def jsonrpc_storage_inventory(self, sort: str = 'size', limit: int = 0):
+        """
+        Summarize storage usage and per-claim details.
+
+        Usage:
+            storage_inventory [--sort=<sort>] [--limit=<n>]
+
+        Options:
+            --sort=<sort> : (str) one of: size | blobs | missing (default: size)
+            --limit=<n>   : (int) limit number of claim entries returned (0 = all)
+
+        Returns:
+            {
+              'totals': { 'network_storage': intMB, 'content_storage': intMB,
+                          'private_storage': intMB, 'total': intMB },
+              'claims': [ { 'claim_id': str, 'name': str, 'url': str,
+                            'sd_hash': str, 'stream_hash': str, 'saved_file': bool, 'pinned': bool,
+                            'blobs_present': int, 'blobs_total': int, 'size_mb': int, 'last_added_on': int } ]
+            }
+        """
+        storage = self.storage
+        totals = await storage.get_stored_blob_disk_usage()
+        streams = await storage.list_stream_hashes()
+        saved_map = await storage.get_saved_status_map()
+        entries = []
+        for stream_hash in streams:
+            blobs = await storage.get_blobs_for_stream(stream_hash, only_completed=False)
+            present = [b for b in blobs if getattr(b, 'length', 0) and b.length > 0]
+            size_mb = int(sum(b.length for b in present) / (1024*1024)) if present else 0
+            last_added = max((b.added_on for b in present), default=0)
+            sd_hash = await storage.get_sd_blob_hash_for_stream(stream_hash)
+            claim = await storage.get_content_claim(stream_hash, include_supports=False)
+            name = claim.get('claim_name') if claim else None
+            claim_id = claim.get('claim_id') if claim else None
+            url = f"lbry://{name}#{claim_id}" if (name and claim_id) else None
+            pinned = await storage.is_stream_pinned(stream_hash)
+            entries.append({
+                'claim_id': claim_id,
+                'name': name,
+                'url': url,
+                'sd_hash': sd_hash,
+                'stream_hash': stream_hash,
+                'saved_file': bool(saved_map.get(stream_hash, 0)),
+                'pinned': pinned,
+                'blobs_present': len(present),
+                'blobs_total': len(blobs),
+                'size_mb': size_mb,
+                'last_added_on': last_added,
+            })
+
+        key = {'size': 'size_mb', 'blobs': 'blobs_present', 'missing': None}.get(sort, 'size_mb')
+        if key:
+            entries.sort(key=lambda e: e.get(key, 0), reverse=True)
+        elif sort == 'missing':
+            entries.sort(key=lambda e: (e['blobs_total'] - e['blobs_present']), reverse=True)
+        if limit and limit > 0:
+            entries = entries[:limit]
+
+        to_mb = lambda x: int(x/1024/1024)
+        result = {
+            'totals': {
+                'network_storage': to_mb(totals['network_storage']),
+                'content_storage': to_mb(totals['content_storage']),
+                'private_storage': to_mb(totals['private_storage']),
+                'total': to_mb(totals['total']),
+            },
+            'claims': entries
+        }
+        return result
+
+    async def _locate_stream_hash(self, url=None, claim_id=None, sd_hash=None):
+        storage = self.storage
+        if sd_hash:
+            return await storage.get_stream_hash_for_sd_hash(sd_hash)
+        if claim_id:
+            return await storage.get_stream_hash_by_claim_id(claim_id)
+        if url:
+            resolved = await self.resolve([], [url])
+            item = resolved.get(url)
+            if isinstance(item, Output):
+                return await storage.get_stream_hash_by_claim_id(item.claim_id)
+        return None
+
+    @requires(DATABASE_COMPONENT)
+    async def jsonrpc_storage_map(self, url=None, claim_id=None, sd_hash=None):
+        """
+        Show blobs for a specific claim/stream.
+
+        Usage:
+            storage_map [--url=<url> | --claim_id=<claim_id> | --sd_hash=<sd_hash>]
+
+        Returns:
+            {
+              'claim': { 'claim_id': str, 'name': str, 'url': str },
+              'sd_hash': str,
+              'stream_hash': str,
+              'pinned': bool,
+              'saved_file': bool,
+              'blobs': [ { 'position': int, 'blob_hash': str, 'length': int, 'present': bool, 'added_on': int } ],
+              'blobs_present': int,
+              'blobs_total': int,
+              'size_mb': int
+            }
+        """
+        stream_hash = await self._locate_stream_hash(url, claim_id, sd_hash)
+        if not stream_hash:
+            return {'error': 'stream not found for provided identifier'}
+        storage = self.storage
+        sd_hash = await storage.get_sd_blob_hash_for_stream(stream_hash)
+        blobs = await storage.get_blobs_for_stream(stream_hash, only_completed=False)
+        blob_list = []
+        present = 0
+        total_size = 0
+        for b in blobs:
+            length = getattr(b, 'length', 0) or 0
+            is_present = length > 0
+            present += 1 if is_present else 0
+            total_size += length if is_present else 0
+            blob_list.append({
+                'position': b.position,
+                'blob_hash': b.blob_hash,
+                'length': length,
+                'present': is_present,
+                'added_on': b.added_on,
+            })
+        claim = await storage.get_content_claim(stream_hash, include_supports=False)
+        name = claim.get('claim_name') if claim else None
+        cid = claim.get('claim_id') if claim else None
+        url_str = f"lbry://{name}#{cid}" if (name and cid) else None
+        saved_map = await storage.get_saved_status_map()
+        pinned = await storage.is_stream_pinned(stream_hash)
+        return {
+            'claim': {'claim_id': cid, 'name': name, 'url': url_str},
+            'sd_hash': sd_hash,
+            'stream_hash': stream_hash,
+            'pinned': pinned,
+            'saved_file': bool(saved_map.get(stream_hash, 0)),
+            'blobs': blob_list,
+            'blobs_present': present,
+            'blobs_total': len(blobs),
+            'size_mb': int(total_size/1024/1024)
+        }
+
+    @requires(DATABASE_COMPONENT)
+    async def jsonrpc_storage_pin(self, url=None, claim_id=None, sd_hash=None):
+        """
+        Pin (protect) blobs for a claim/stream (prevents cleanup).
+
+        Usage:
+            storage_pin [--url=<url> | --claim_id=<claim_id> | --sd_hash=<sd_hash>]
+        """
+        storage = self.storage
+        if not sd_hash:
+            stream_hash = await self._locate_stream_hash(url, claim_id, sd_hash)
+            if not stream_hash:
+                return {'error': 'stream not found for provided identifier'}
+            sd_hash = await storage.get_sd_blob_hash_for_stream(stream_hash)
+        await storage.update_blob_ownership(sd_hash, True)
+        return {'pinned': True, 'sd_hash': sd_hash}
+
+    @requires(DATABASE_COMPONENT)
+    async def jsonrpc_storage_unpin(self, url=None, claim_id=None, sd_hash=None):
+        """
+        Unpin blobs for a claim/stream (cleanup may remove non-saved blobs).
+
+        Usage:
+            storage_unpin [--url=<url> | --claim_id=<claim_id> | --sd_hash=<sd_hash>]
+        """
+        storage = self.storage
+        if not sd_hash:
+            stream_hash = await self._locate_stream_hash(url, claim_id, sd_hash)
+            if not stream_hash:
+                return {'error': 'stream not found for provided identifier'}
+            sd_hash = await storage.get_sd_blob_hash_for_stream(stream_hash)
+        await storage.update_blob_ownership(sd_hash, False)
+        return {'pinned': False, 'sd_hash': sd_hash}
+
+    @requires(DATABASE_COMPONENT)
+    async def jsonrpc_storage_pins(self):
+        """
+        List pinned claims.
+
+        Usage:
+            storage_pins
+        """
+        storage = self.storage
+        pinned_streams = await storage.list_pinned_streams()
+        saved_map = await storage.get_saved_status_map()
+        out = []
+        for stream_hash in pinned_streams:
+            claim = await storage.get_content_claim(stream_hash, include_supports=False)
+            name = claim.get('claim_name') if claim else None
+            cid = claim.get('claim_id') if claim else None
+            url = f"lbry://{name}#{cid}" if (name and cid) else None
+            sd_hash = await storage.get_sd_blob_hash_for_stream(stream_hash)
+            blobs = await storage.get_blobs_for_stream(stream_hash, only_completed=False)
+            size_mb = int(sum((getattr(b, 'length', 0) or 0) for b in blobs) / 1024/1024)
+            out.append({'claim_id': cid, 'name': name, 'url': url, 'sd_hash': sd_hash,
+                        'stream_hash': stream_hash, 'saved_file': bool(saved_map.get(stream_hash, 0)),
+                        'size_mb': size_mb})
+        return out
+
     @requires(WALLET_COMPONENT, DHT_COMPONENT, BLOB_COMPONENT)
     async def jsonrpc_blob_get(self, blob_hash, timeout=None, read=False):
         """
@@ -4925,7 +5148,11 @@ class Daemon(metaclass=JSONRPCServerType):
             (str) Success/Fail message or (dict) decoded data
         """
 
-        blob = await download_blob(asyncio.get_event_loop(), self.conf, self.blob_manager, self.dht_node, blob_hash)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        blob = await download_blob(loop, self.conf, self.blob_manager, self.dht_node, blob_hash)
         if read:
             with blob.reader_context() as handle:
                 return handle.read().decode()
@@ -4982,7 +5209,7 @@ class Daemon(metaclass=JSONRPCServerType):
         if not is_valid_blobhash(blob_hash):
             # TODO: use error from lbry.error
             raise Exception("invalid blob hash")
-        peer_q = asyncio.Queue(loop=self.component_manager.loop)
+        peer_q = asyncio.Queue()
         if self.component_manager.has_component(TRACKER_ANNOUNCER_COMPONENT):
             tracker = self.component_manager.get_component(TRACKER_ANNOUNCER_COMPONENT)
             tracker_peers = await tracker.get_kademlia_peer_list(bytes.fromhex(blob_hash))
@@ -5150,7 +5377,8 @@ class Daemon(metaclass=JSONRPCServerType):
         Usage:
             file_reflect [--sd_hash=<sd_hash>] [--file_name=<file_name>]
                          [--stream_hash=<stream_hash>] [--rowid=<rowid>]
-                         [--reflector=<reflector>]
+                         [--reflector=<reflector>] [--server=<server>] [--port=<port>]
+                         [--timeout=<seconds>]
 
         Options:
             --sd_hash=<sd_hash>          : (str) get file with matching sd hash
@@ -5160,24 +5388,276 @@ class Daemon(metaclass=JSONRPCServerType):
             --rowid=<rowid>              : (int) get file with matching row id
             --reflector=<reflector>      : (str) reflector server, ip address or url
                                            by default choose a server from the config
+            --server=<server>            : (str) reflector host override
+            --port=<port>                : (int) reflector port override
+            --timeout=<seconds>          : (float) optional timeout per stream reflection
 
         Returns:
-            (list) list of blobs reflected
+            (list) per-stream reflection info
         """
 
-        server, port = kwargs.get('server'), kwargs.get('port')
-        if server and port:
-            port = int(port)
-        else:
-            server, port = random.choice(self.conf.reflector_servers)
-        reflected = await asyncio.gather(*[
-            self.file_manager.source_managers['stream'].reflect_stream(stream, server, port)
-            for stream in self.file_manager.get_filtered(**kwargs)
-        ])
-        total = []
-        for reflected_for_stream in reflected:
-            total.extend(reflected_for_stream)
-        return total
+        filters = dict(kwargs)
+        timeout = filters.pop('timeout', None)
+        if timeout is not None:
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                raise ValueError("timeout must be a number of seconds") from None
+
+        reflector = filters.pop('reflector', None)
+        server = filters.pop('server', None)
+        port = filters.pop('port', None)
+
+        if reflector and not (server or port):
+            if ':' in reflector:
+                server, port_str = reflector.rsplit(':', 1)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    raise ValueError("reflector port must be an integer") from None
+            else:
+                server = reflector
+
+        if port is not None:
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                raise ValueError("reflector port must be an integer") from None
+
+        streams = self.file_manager.get_filtered(**filters)
+        total_streams = len(streams)
+        if not total_streams:
+            return []
+
+        results = []
+        stream_manager = self.file_manager.source_managers['stream']
+        for idx, stream in enumerate(streams, start=1):
+            chosen_server, chosen_port = server, port
+            if not chosen_server or not chosen_port:
+                chosen_server, chosen_port = random.choice(self.conf.reflector_servers)
+            log.info(
+                "Reflecting stream %s (%d/%d) via %s:%d",
+                stream.sd_hash[:6], idx, total_streams, chosen_server, chosen_port
+            )
+            sent: typing.List[str] = []
+            start_time = time.perf_counter()
+            task = stream_manager.reflect_stream(stream, chosen_server, chosen_port)
+            try:
+                if timeout:
+                    sent = await asyncio.wait_for(task, timeout)
+                else:
+                    sent = await task
+                elapsed = time.perf_counter() - start_time
+                results.append({
+                    "sd_hash": stream.sd_hash,
+                    "stream_hash": stream.stream_hash,
+                    "reflected_blobs": sent,
+                    "blob_count": len(sent),
+                    "fully_reflected": stream.fully_reflected.is_set(),
+                    "reflector": f"{chosen_server}:{chosen_port}",
+                    "elapsed": elapsed,
+                })
+                log.info(
+                    "Reflected %d blobs for %s (%d/%d) in %.2fs",
+                    len(sent), stream.sd_hash[:6], idx, total_streams, elapsed
+                )
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                elapsed = time.perf_counter() - start_time
+                log.warning(
+                    "Timed out reflecting %s after %.2fs via %s:%d",
+                    stream.sd_hash[:6], elapsed, chosen_server, chosen_port
+                )
+                results.append({
+                    "sd_hash": stream.sd_hash,
+                    "stream_hash": stream.stream_hash,
+                    "reflected_blobs": sent,
+                    "blob_count": len(sent),
+                    "fully_reflected": stream.fully_reflected.is_set(),
+                    "reflector": f"{chosen_server}:{chosen_port}",
+                    "elapsed": elapsed,
+                    "error": "timeout",
+                })
+            except Exception as err:  # pragma: no cover
+                log.exception("Unexpected error reflecting %s", stream.sd_hash)
+                results.append({
+                    "sd_hash": stream.sd_hash,
+                    "stream_hash": stream.stream_hash,
+                    "reflected_blobs": sent,
+                    "blob_count": len(sent),
+                    "fully_reflected": stream.fully_reflected.is_set(),
+                    "reflector": f"{chosen_server}:{chosen_port}",
+                    "error": str(err),
+                })
+        return results
+
+    @requires(BLOB_COMPONENT, FILE_MANAGER_COMPONENT)
+    async def jsonrpc_blob_reindex(self, directory: typing.Optional[str] = None, limit: typing.Optional[int] = None):
+        """
+        Scan blob directories for stream descriptors and register any missing streams/blobs.
+
+        Usage:
+            blob_reindex [--directory=<path>] [--limit=<count>]
+
+        Options:
+            --directory=<path> : (str) optional directory to scan instead of the configured blob dirs
+            --limit=<count>    : (int) optional number of descriptors to process
+
+        Returns:
+            (dict) {
+                "found": <int>,
+                "added": <int>,
+                "skipped": <int>,
+                "streams": [ { sd_hash, stream_hash, blobs, missing, error?, elapsed } ... ]
+            }
+        """
+
+        loop = asyncio.get_running_loop()
+        blob_dirs = [directory] if directory else list(self.blob_manager.blob_dirs)
+        blob_dirs = [os.path.abspath(d) for d in blob_dirs if d and os.path.isdir(d)]
+        if not blob_dirs:
+            raise ValueError("no blob directories to scan")
+
+        try:
+            limit = int(limit) if limit is not None else None
+            if limit is not None and limit <= 0:
+                limit = None
+        except (TypeError, ValueError):
+            raise ValueError("limit must be an integer") from None
+
+        existing_streams = set(await self.file_manager.storage.get_all_stream_hashes())
+        processed = 0
+        added = 0
+        skipped = 0
+        streams_info: typing.List[typing.Dict[str, typing.Any]] = []
+
+        def _candidate_hashes(path: str) -> typing.List[str]:
+            try:
+                entries = os.listdir(path)
+            except OSError:
+                return []
+            candidates = []
+            for entry in entries:
+                if len(entry) != 96:
+                    continue
+                if all(c in string.hexdigits for c in entry):
+                    candidates.append(entry.lower())
+            return candidates
+
+        for blob_dir in blob_dirs:
+            hashes = await loop.run_in_executor(None, _candidate_hashes, blob_dir)
+            for sd_hash in hashes:
+                if limit is not None and processed >= limit:
+                    break
+                processed += 1
+                sd_blob = self.blob_manager.get_blob(sd_hash)
+                start_time = time.perf_counter()
+                try:
+                    descriptor = await StreamDescriptor.from_stream_descriptor_blob(
+                        loop, self.blob_manager.blob_dir, sd_blob
+                    )
+                except InvalidStreamDescriptorError:
+                    skipped += 1
+                    continue
+                except Exception as err:
+                    log.debug("failed to parse blob %s as descriptor: %s", sd_hash[:6], err)
+                    skipped += 1
+                    continue
+
+                stream_hash = descriptor.stream_hash
+                if stream_hash in existing_streams:
+                    skipped += 1
+                    continue
+
+                # verify required blobs exist locally
+                missing = []
+                blob_tasks = []
+                for blob_info in descriptor.blobs:
+                    if not blob_info.blob_hash:
+                        continue
+                    blob_file = self.blob_manager.get_blob(blob_info.blob_hash, blob_info.length)
+                    if not blob_file.file_exists:
+                        missing.append(blob_info.blob_hash)
+                        break
+                    blob_file.length = blob_file.length or blob_info.length
+                    blob_tasks.append(self.blob_manager.blob_completed(blob_file))
+
+                if missing:
+                    log.warning("descriptor %s missing %d blobs, skipping", sd_hash[:6], len(missing))
+                    streams_info.append({
+                        "sd_hash": sd_hash,
+                        "stream_hash": stream_hash,
+                        "missing": missing,
+                        "error": "missing_blobs"
+                    })
+                    skipped += 1
+                    continue
+
+                try:
+                    await self.file_manager.storage.store_stream(sd_blob, descriptor)
+                    await asyncio.gather(*blob_tasks)
+                    await self.blob_manager.blob_completed(sd_blob)
+
+                    file_name = descriptor.suggested_file_name or descriptor.stream_name or None
+                    download_directory = None
+                    if not file_name:
+                        download_directory = None
+                    if not file_name or not download_directory:
+                        # ensure we don't mark a download location when it is unknown
+                        file_name_for_db = None
+                        download_directory_for_db = None
+                    else:
+                        file_name_for_db = file_name
+                        download_directory_for_db = download_directory
+
+                    rowid = await self.file_manager.storage.save_published_file(
+                        descriptor.stream_hash,
+                        file_name_for_db,
+                        download_directory_for_db,
+                        0.0,
+                        status=ManagedStream.STATUS_STOPPED,
+                        added_on=int(time.time())
+                    )
+                    await self.file_manager._load_stream(
+                        rowid,
+                        descriptor.sd_hash,
+                        file_name,
+                        None,
+                        ManagedStream.STATUS_STOPPED,
+                        None,
+                        None,
+                        int(time.time()),
+                        False
+                    )
+                    existing_streams.add(stream_hash)
+                    elapsed = time.perf_counter() - start_time
+                    streams_info.append({
+                        "sd_hash": sd_hash,
+                        "stream_hash": stream_hash,
+                        "blobs": len(descriptor.blobs),
+                        "elapsed": elapsed
+                    })
+                    added += 1
+                    log.info("Indexed stream %s (%d blobs)", sd_hash[:6], len(descriptor.blobs))
+                except Exception as err:
+                    log.exception("failed to register descriptor %s", sd_hash)
+                    streams_info.append({
+                        "sd_hash": sd_hash,
+                        "stream_hash": stream_hash,
+                        "error": str(err)
+                    })
+                    skipped += 1
+
+            if limit is not None and processed >= limit:
+                break
+
+        return {
+            "found": processed,
+            "added": added,
+            "skipped": skipped,
+            "streams": streams_info
+        }
 
     @requires(DHT_COMPONENT)
     async def jsonrpc_peer_ping(self, node_id, address, port):
@@ -5251,6 +5731,125 @@ class Daemon(metaclass=JSONRPCServerType):
 
         result['node_id'] = hexlify(self.dht_node.protocol.node_id).decode()
         return result
+
+    DHT_DOC = """
+    DHT operations and diagnostics.
+
+    Commands:
+      - counts: Show basic DHT health/capacity counters.
+    """
+
+    @requires(DHT_COMPONENT)
+    def jsonrpc_dht_counts(self):
+        """
+        Get basic DHT counters (routing, peers, storage).
+
+        Usage:
+            dht_counts
+
+        Options:
+            None
+
+        Returns:
+            (dict)
+            {
+              'buckets': (int) number of populated routing-table buckets,
+              'good_peers_recent': (int) peers that are currently considered good,
+              'peers': (int) total peers in routing table,
+              'stored_blobs': (int) number of blob announcements stored
+            }
+        """
+        rt = self.dht_node.protocol.routing_table
+        peers = rt.get_peers()
+        pm = self.dht_node.protocol.peer_manager
+        good = 0
+        for p in peers:
+            try:
+                if pm.peer_is_good(p) is True:
+                    good += 1
+            except Exception:
+                # best-effort; skip malformed entries
+                continue
+        return {
+            'buckets': rt.buckets_with_contacts(),
+            'good_peers_recent': good,
+            'peers': len(peers),
+            'stored_blobs': len(list(self.dht_node.stored_blob_hashes)),
+        }
+
+    @requires(DHT_COMPONENT)
+    async def jsonrpc_dht_walk(self, targets: int = 8, max_results: int = 32, await_seconds: float = 0.0):
+        """
+        Actively walk the DHT to discover additional peers.
+
+        Usage:
+            dht_walk [--targets=<n>] [--max_results=<n>] [--await_seconds=<s>]
+
+        Options:
+            --targets=<n>        : (int) number of target IDs to probe (default 8)
+            --max_results=<n>    : (int) peers to retrieve per target (default 32)
+            --await_seconds=<s>  : (float) wait this many seconds for pings to update routing table
+
+        Returns:
+            (dict)
+            {
+              'before': (int) peers before the walk,
+              'after': (int) peers after the walk,
+              'discovered': (int) newly added peers,
+              'discovered_endpoints': [(str, int)] sample of new peers,
+              'buckets': (int) populated buckets after the walk
+            }
+        """
+        rt = self.dht_node.protocol.routing_table
+        pm = self.dht_node.protocol.peer_manager
+        before_peers = rt.get_peers()
+        before_set = {(p.address, p.udp_port) for p in before_peers}
+
+        try:
+            targets = max(1, int(targets))
+        except Exception:
+            targets = 8
+        try:
+            max_results = max(1, int(max_results))
+        except Exception:
+            max_results = 32
+        try:
+            await_seconds = max(0.0, float(await_seconds))
+        except Exception:
+            await_seconds = 0.0
+
+        refresh_ids = rt.get_refresh_list(0, True)
+        if refresh_ids:
+            refresh_ids = refresh_ids[:targets]
+        total_peers = []
+        for key in refresh_ids or []:
+            try:
+                peers = await self.dht_node.peer_search(key, count=max_results, max_results=max_results)
+            except Exception:
+                continue
+            total_peers.extend(peers)
+
+        # Ping peers we don't yet consider good to nudge routing table updates
+        to_ping = [peer for peer in set(total_peers) if pm.peer_is_good(peer) is not True]
+        if to_ping:
+            self.dht_node.protocol.ping_queue.enqueue_maybe_ping(*to_ping, delay=0.0)
+
+        if await_seconds > 0:
+            try:
+                await asyncio.sleep(await_seconds)
+            except Exception:
+                pass
+
+        after_peers = rt.get_peers()
+        after_set = {(p.address, p.udp_port) for p in after_peers}
+        new_endpoints = sorted(list(after_set - before_set))
+        return {
+            'before': len(before_set),
+            'after': len(after_set),
+            'discovered': max(0, len(new_endpoints)),
+            'discovered_endpoints': new_endpoints[:50],
+            'buckets': rt.buckets_with_contacts(),
+        }
 
     TRACEMALLOC_DOC = """
     Controls and queries tracemalloc memory tracing tools for troubleshooting.
@@ -5462,7 +6061,40 @@ class Daemon(metaclass=JSONRPCServerType):
             raise ValueError(f"Invalid value for '{argument}': {e.args[0]}")
 
     async def resolve(self, accounts, urls, **kwargs):
-        results = await self.ledger.resolve(accounts, urls, **kwargs)
+        # Support optional hub cycling via flags or config
+        cycle_flag = bool(kwargs.pop('cycle_hubs', False))
+        cycle_on_blocked = bool(kwargs.pop('cycle_on_blocked', False))
+        max_hub_cycles = kwargs.pop('max_hub_cycles', None)
+        if max_hub_cycles is not None:
+            try:
+                max_hub_cycles = int(max_hub_cycles)
+            except Exception:
+                max_hub_cycles = None
+
+        # If not explicitly requested, fall back to config toggles
+        if not cycle_flag:
+            try:
+                cycle_flag = bool(self.conf.cycle_hubs_on_not_found)
+            except Exception:
+                cycle_flag = False
+        if not cycle_on_blocked:
+            try:
+                cycle_on_blocked = bool(self.conf.cycle_hubs_on_blocked)
+            except Exception:
+                cycle_on_blocked = False
+        if max_hub_cycles is None:
+            try:
+                max_hub_cycles = int(self.conf.max_hub_cycles)
+            except Exception:
+                max_hub_cycles = None
+
+        if cycle_flag:
+            results = await self.ledger.resolve_with_hub_cycle(
+                accounts, urls, cycle_on_blocked=cycle_on_blocked,
+                max_hub_cycles=max_hub_cycles, **kwargs
+            )
+        else:
+            results = await self.ledger.resolve(accounts, urls, **kwargs)
         if self.conf.save_resolved_claims and results:
             try:
                 await self.storage.save_claim_from_output(

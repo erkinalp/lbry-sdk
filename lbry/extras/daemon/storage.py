@@ -338,14 +338,30 @@ class SQLiteStorage(SQLiteMixin):
                 unique (address, udp_port)
             );
             create index if not exists blob_data on blob(blob_hash, blob_length, is_mine);
+            create index if not exists support_claim_id_idx on support(claim_id);
+            create index if not exists claim_claim_id_idx on claim(claim_id);
+            create index if not exists content_claim_bt_infohash_idx on content_claim(bt_infohash);
+            create index if not exists blob_next_announce_status_idx on blob(next_announce_time, status);
+            create index if not exists blob_should_announce_idx on blob(should_announce);
+            create index if not exists blob_single_announce_idx on blob(single_announce);
     """
 
     def __init__(self, conf: Config, path, loop=None, time_getter: typing.Optional[typing.Callable[[], float]] = None):
         super().__init__(path)
         self.conf = conf
         self.content_claim_callbacks = {}
-        self.loop = loop or asyncio.get_event_loop()
+        self._loop = loop
         self.time_getter = time_getter or time.time
+
+    @property
+    def loop(self):
+        """Get the event loop, preferring the running loop if available."""
+        if self._loop:
+            return self._loop
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.get_event_loop()
 
     async def run_and_return_one_or_none(self, query, *args):
         for row in await self.db.execute_fetchall(query, args):
@@ -499,6 +515,38 @@ class SQLiteStorage(SQLiteMixin):
             ") OR blob_hash = ?", (is_mine, sd_hash, sd_hash)
         )
 
+    # --- Helpers for storage inventory / pins ---
+    async def list_stream_hashes(self):
+        return await self.run_and_return_list("select stream_hash from stream")
+
+    async def get_saved_status_map(self):
+        rows = await self.db.execute_fetchall("select stream_hash, saved_file from file")
+        return {stream_hash: bool(saved) for stream_hash, saved in rows}
+
+    async def is_stream_pinned(self, stream_hash: str) -> bool:
+        row = await self.db.execute_fetchone(
+            "select 1 from blob b inner join stream_blob s on b.blob_hash=s.blob_hash "
+            "where s.stream_hash=? and b.is_mine=1 limit 1",
+            (stream_hash,)
+        )
+        return bool(row)
+
+    async def get_stream_hash_by_claim_id(self, claim_id: str):
+        return await self.run_and_return_one_or_none(
+            "select stream_hash from content_claim join claim using (claim_outpoint) where claim_id=?",
+            claim_id
+        )
+
+    async def get_stream_hash_for_sd_hash(self, sd_hash: str):
+        return await self.run_and_return_one_or_none(
+            "select stream_hash from stream where sd_hash=?", sd_hash
+        )
+
+    async def list_pinned_streams(self):
+        return await self.run_and_return_list(
+            "select distinct s.stream_hash from blob b join stream_blob s on b.blob_hash=s.blob_hash where b.is_mine=1"
+        )
+
     def sync_missing_blobs(self, blob_files: typing.Set[str]) -> typing.Awaitable[typing.Set[str]]:
         def _sync_blobs(transaction: sqlite3.Connection) -> typing.Set[str]:
             finished_blob_hashes = tuple(
@@ -569,7 +617,7 @@ class SQLiteStorage(SQLiteMixin):
             "select sd_hash from stream where stream_hash=?", stream_hash
         )
 
-    def get_stream_hash_for_sd_hash(self, sd_blob_hash):
+    def get_stream_hash_for_sd_blob(self, sd_blob_hash):
         return self.run_and_return_one_or_none(
             "select stream_hash from stream where sd_hash = ?", sd_blob_hash
         )
@@ -657,14 +705,24 @@ class SQLiteStorage(SQLiteMixin):
         ))
 
     async def set_saved_file(self, stream_hash: str):
-        return await self.db.execute_fetchall("update file set saved_file=1 where stream_hash=?", (
+        result = await self.db.execute_fetchall("update file set saved_file=1 where stream_hash=?", (
             stream_hash,
         ))
+        if getattr(self.conf, 'pin_on_save_file', False):
+            sd_hash = await self.get_sd_blob_hash_for_stream(stream_hash)
+            if sd_hash:
+                await self.update_blob_ownership(sd_hash, True)
+        return result
 
     async def clear_saved_file(self, stream_hash: str):
-        return await self.db.execute_fetchall("update file set saved_file=0 where stream_hash=?", (
+        result = await self.db.execute_fetchall("update file set saved_file=0 where stream_hash=?", (
             stream_hash,
         ))
+        if getattr(self.conf, 'pin_on_save_file', False):
+            sd_hash = await self.get_sd_blob_hash_for_stream(stream_hash)
+            if sd_hash:
+                await self.update_blob_ownership(sd_hash, False)
+        return result
 
     async def recover_streams(self, descriptors_and_sds: typing.List[typing.Tuple['StreamDescriptor', 'BlobFile',
                                                                                   typing.Optional[Transaction]]],
@@ -793,7 +851,15 @@ class SQLiteStorage(SQLiteMixin):
 
         await self.db.run(_save_claims)
         if update_file_callbacks:
-            await asyncio.wait(map(asyncio.create_task, update_file_callbacks))
+            # Bound concurrency for file update callbacks to avoid event-loop spikes
+            limit = getattr(self.conf, 'claim_callback_concurrency', 24)
+            sem = asyncio.Semaphore(limit)
+
+            async def _runner(coro):
+                async with sem:
+                    return await coro
+
+            await asyncio.gather(*(_runner(cb) for cb in update_file_callbacks))
         if claim_id_to_supports:
             await self.save_supports(claim_id_to_supports)
 

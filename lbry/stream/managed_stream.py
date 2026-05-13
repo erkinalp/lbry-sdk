@@ -168,7 +168,7 @@ class ManagedStream(ManagedDownloadSource):
 
         if self.delayed_stop_task and not self.delayed_stop_task.done():
             self.delayed_stop_task.cancel()
-        self.delayed_stop_task = self.loop.create_task(self._delayed_stop())
+        self.delayed_stop_task = asyncio.get_running_loop().create_task(self._delayed_stop())
         if not await self.blob_manager.storage.file_exists(self.sd_hash):
             if save_now:
                 if not self._file_name:
@@ -267,12 +267,12 @@ class ManagedStream(ManagedDownloadSource):
             open(output_path, 'wb').close()  # pylint: disable=consider-using-with
             async for blob_info, decrypted in self._aiter_read_stream(connection_id=self.SAVING_ID):
                 log.info("write blob %i/%i", blob_info.blob_num + 1, len(self.descriptor.blobs) - 1)
-                await self.loop.run_in_executor(None, self._write_decrypted_blob, output_path, decrypted)
+                await asyncio.get_running_loop().run_in_executor(None, self._write_decrypted_blob, output_path, decrypted)
                 if not self.started_writing.is_set():
                     self.started_writing.set()
             await self.update_status(ManagedStream.STATUS_FINISHED)
             if self.analytics_manager:
-                self.loop.create_task(self.analytics_manager.send_download_finished(
+                asyncio.get_running_loop().create_task(self.analytics_manager.send_download_finished(
                     self.download_id, self.claim_name, self.sd_hash
                 ))
             self.finished_writing.set()
@@ -319,7 +319,7 @@ class ManagedStream(ManagedDownloadSource):
             self.stream_hash, self.download_directory, self.file_name
         )
         await self.update_status(ManagedStream.STATUS_RUNNING)
-        self.file_output_task = self.loop.create_task(self._save_file(self.full_path))
+        self.file_output_task = asyncio.get_running_loop().create_task(self._save_file(self.full_path))
         try:
             await asyncio.wait_for(self.started_writing.wait(), self.config.download_timeout)
         except asyncio.TimeoutError:

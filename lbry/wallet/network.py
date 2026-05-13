@@ -5,7 +5,7 @@ import socket
 import random
 from time import perf_counter
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import aiohttp
 
 from lbry import __version__
@@ -65,7 +65,7 @@ class ClientSession(BaseClientSession):
             await self._concurrency.acquire()
             if method == 'server.version':
                 return await self.send_timed_server_version_request(args, self.timeout)
-            request = asyncio.ensure_future(super().send_request(method, args))
+            request = asyncio.create_task(super().send_request(method, args))
             while not request.done():
                 done, pending = await asyncio.wait([request], timeout=self.timeout)
                 if pending:
@@ -248,7 +248,7 @@ class Network:
         return hostname_to_ip, ip_to_hostnames
 
     async def get_n_fastest_spvs(self, timeout=3.0) -> Dict[Tuple[str, int], Optional[SPVPong]]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         pong_responses = asyncio.Queue()
         connection = SPVStatusClientProtocol(pong_responses)
         sent_ping_timestamps = {}
@@ -314,10 +314,14 @@ class Network:
     async def network_loop(self):
         sleep_delay = 30
         while self.running:
-            await asyncio.wait(
-                map(asyncio.create_task, [asyncio.sleep(30), self._urgent_need_reconnect.wait()]),
+            sleep_task = asyncio.create_task(asyncio.sleep(sleep_delay))
+            urgent_task = asyncio.create_task(self._urgent_need_reconnect.wait())
+            done, pending = await asyncio.wait(
+                [sleep_task, urgent_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
+            for task in pending:
+                task.cancel()
             if self._urgent_need_reconnect.is_set():
                 sleep_delay = 30
             self._urgent_need_reconnect.clear()
@@ -475,6 +479,32 @@ class Network:
 
     def claim_search(self, session_override=None, **kwargs):
         return self.rpc('blockchain.claimtrie.search', kwargs, False, session_override)
+
+    # --- Hub cycling helpers ---
+    async def open_temp_session(self, server: Tuple[str, int], timeout: float = 6.0) -> ClientSession:
+        session = ClientSession(network=self, server=server, timeout=int(self.client.timeout) if self.client else 30,
+                                concurrency=32)
+        await session.create_connection(timeout=timeout)
+        await session.ensure_server_version(timeout=timeout)
+        return session
+
+    def get_candidate_servers(self) -> List[Tuple[str, int]]:
+        # Prefer explicit servers, then known hubs, then default
+        if self.config.get('explicit_servers', []):
+            hubs = self.config['explicit_servers']
+        elif self.known_hubs:
+            hubs = list(self.known_hubs.hubs.keys())
+        else:
+            hubs = self.config['default_servers']
+        # Normalize to list of tuples
+        return [(h[0], h[1]) for h in hubs]
+
+    async def resolve_on_server(self, server: Tuple[str, int], urls):
+        session = await self.open_temp_session(server)
+        try:
+            return await self.resolve(urls, session_override=session)
+        finally:
+            await session.close()
 
     async def sum_supports(self, server, **kwargs):
         message = {"method": "support_sum", "params": kwargs}

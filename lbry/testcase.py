@@ -113,7 +113,7 @@ class AsyncioTestCase(unittest.TestCase):
             try:
                 skip_why = (getattr(self.__class__, '__unittest_skip_why__', '')
                             or getattr(testMethod, '__unittest_skip_why__', ''))
-                self._addSkip(result, self, skip_why)
+                result.addSkip(self, skip_why)
             finally:
                 result.stopTest(self)
             return
@@ -137,13 +137,15 @@ class AsyncioTestCase(unittest.TestCase):
                 self.add_timeout()
                 self.loop.run_until_complete(self.asyncSetUp())
             if outcome.success:
-                outcome.expecting_failure = expecting_failure
-                with outcome.testPartExecutor(self, isTest=True):
+                if hasattr(outcome, 'expecting_failure'):
+                    outcome.expecting_failure = expecting_failure
+                with outcome.testPartExecutor(self):
                     maybe_coroutine = testMethod()
                     if asyncio.iscoroutine(maybe_coroutine):
                         self.add_timeout()
                         self.loop.run_until_complete(maybe_coroutine)
-                outcome.expecting_failure = False
+                if hasattr(outcome, 'expecting_failure'):
+                    outcome.expecting_failure = False
                 with outcome.testPartExecutor(self):
                     self.add_timeout()
                     self.loop.run_until_complete(self.asyncTearDown())
@@ -158,15 +160,20 @@ class AsyncioTestCase(unittest.TestCase):
                 asyncio.set_event_loop(None)
                 self.loop.close()
 
-            for test, reason in outcome.skipped:
-                self._addSkip(result, test, reason)
-            self._feedErrorsToResult(result, outcome.errors)
+            # In Python 3.12+, _Outcome no longer has these attributes
+            # The outcome reports results directly through the context managers
+            if hasattr(outcome, 'skipped'):
+                for test, reason in outcome.skipped:
+                    result.addSkip(test, reason)
+            if hasattr(outcome, 'errors'):
+                for test, exc_info in outcome.errors:
+                    result.addError(test, exc_info)
             if outcome.success:
                 if expecting_failure:
-                    if outcome.expectedFailure:
-                        self._addExpectedFailure(result, outcome.expectedFailure)
+                    if hasattr(outcome, 'expectedFailure') and outcome.expectedFailure:
+                        result.addExpectedFailure(self, outcome.expectedFailure)
                     else:
-                        self._addUnexpectedSuccess(result)
+                        result.addUnexpectedSuccess(self)
                 else:
                     result.addSuccess(self)
             return result
@@ -180,8 +187,11 @@ class AsyncioTestCase(unittest.TestCase):
             # explicitly break reference cycles:
             # outcome.errors -> frame -> outcome -> outcome.errors
             # outcome.expectedFailure -> frame -> outcome -> outcome.expectedFailure
-            outcome.errors.clear()
-            outcome.expectedFailure = None
+            # In Python 3.12+, the _Outcome structure changed
+            if hasattr(outcome, 'errors'):
+                outcome.errors.clear()
+            if hasattr(outcome, 'expectedFailure'):
+                outcome.expectedFailure = None
 
             # clear the outcome, no more needed
             self._outcome = None

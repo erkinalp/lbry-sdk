@@ -4,10 +4,18 @@ import shutil
 import signal
 import pathlib
 import json
+import json as jsonlib
 import asyncio
 import argparse
 import logging
 import logging.handlers
+import datetime
+from contextlib import suppress
+
+# Fix for multiprocessing in PyInstaller frozen executables
+import multiprocessing
+if getattr(sys, 'frozen', False):
+    multiprocessing.freeze_support()
 
 import aiohttp
 from aiohttp.web import GracefulExit
@@ -39,6 +47,29 @@ async def execute_command(conf, method, params, callback=display):
                     log.exception('Could not process response from server:', exc_info=e)
         except aiohttp.ClientConnectionError:
             print("Could not connect to daemon. Are you sure it's running?")
+
+
+async def execute_with_spinner(conf, method, params, callback=display):
+    done = asyncio.Event()
+
+    async def spinner(prefix="Working"):
+        syms = "|/-\\"
+        i = 0
+        while not done.is_set():
+            print(f"\r{prefix} {syms[i % len(syms)]}", end='', flush=True)
+            i += 1
+            await asyncio.sleep(0.2)
+        print("\r", end='')
+
+    sp_task = asyncio.create_task(spinner())
+    try:
+        await execute_command(conf, method, params, callback)
+    finally:
+        done.set()
+        await asyncio.sleep(0.21)
+        sp_task.cancel()
+        with suppress(Exception):
+            await sp_task
 
 
 def normalize_value(x, key=None):
@@ -234,8 +265,28 @@ def ensure_directory_exists(path: str):
 LOG_MODULES = 'lbry', 'aioupnp'
 
 
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            'ts': datetime.datetime.fromtimestamp(record.created, tz=datetime.timezone.utc).isoformat(),
+            'level': record.levelname,
+            'logger': record.name,
+            'line': record.lineno,
+            'msg': record.getMessage(),
+        }
+        if record.exc_info:
+            payload['exc_info'] = self.formatException(record.exc_info)
+        return jsonlib.dumps(payload, ensure_ascii=False)
+
+
+def _make_formatter(conf: Config) -> logging.Formatter:
+    if getattr(conf, 'log_format', 'text') == 'json':
+        return JSONFormatter()
+    return logging.Formatter("%(asctime)s %(levelname)-8s %(name)s:%(lineno)d: %(message)s")
+
+
 def setup_logging(logger: logging.Logger, args: argparse.Namespace, conf: Config):
-    default_formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s:%(lineno)d: %(message)s")
+    default_formatter = _make_formatter(conf)
     file_handler = logging.handlers.RotatingFileHandler(conf.log_file_path, maxBytes=2097152, backupCount=5)
     file_handler.setFormatter(default_formatter)
     for module_name in LOG_MODULES:
@@ -249,6 +300,8 @@ def setup_logging(logger: logging.Logger, args: argparse.Namespace, conf: Config
     logger.getChild('lbry').setLevel(logging.INFO)
     logger.getChild('aioupnp').setLevel(logging.WARNING)
     logger.getChild('aiohttp').setLevel(logging.CRITICAL)
+    if getattr(conf, 'quiet_wallet_sync', True):
+        logger.getChild('lbry.wallet.ledger').setLevel(logging.WARNING)
 
     if args.verbose is not None:
         if len(args.verbose) > 0:
@@ -259,7 +312,8 @@ def setup_logging(logger: logging.Logger, args: argparse.Namespace, conf: Config
 
 
 def run_daemon(args: argparse.Namespace, conf: Config):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     if args.verbose is not None:
         loop.set_debug(True)
     if not args.no_logging:
@@ -326,7 +380,16 @@ def main(argv=None):
         else:
             parsed = docopt(doc, command_args)
             params = set_kwargs(parsed)
-            asyncio.get_event_loop().run_until_complete(execute_command(conf, api_method_name, params))
+            # Provide a simple progress note for long-running commands
+            if api_method_name == 'dht_walk':
+                t = params.get('targets', 8)
+                m = params.get('max_results', 32)
+                w = params.get('await_seconds', 0)
+                print(f"Walking DHT (targets={t}, max_results={m}, await_seconds={w}) ...")
+                asyncio.run(execute_with_spinner(conf, api_method_name, params))
+            else:
+                # Avoid DeprecationWarning by using asyncio.run
+                asyncio.run(execute_command(conf, api_method_name, params))
     elif args.group is not None:
         args.group_parser.print_help()
     else:
@@ -336,4 +399,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Ensure multiprocessing support for frozen executables
+    if getattr(sys, 'frozen', False):
+        multiprocessing.freeze_support()
     sys.exit(main())

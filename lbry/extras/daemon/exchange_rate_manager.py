@@ -46,6 +46,8 @@ class MarketFeed:
         self._last_response = None
         self._task: Optional[asyncio.Task] = None
         self.event = asyncio.Event()
+        self._consecutive_failures = 0
+        self._last_failure_signature: Optional[str] = None
 
     @property
     def has_rate(self):
@@ -79,19 +81,25 @@ class MarketFeed:
             log.debug("Saving rate update %f for %s from %s", rate, self.market, self.name)
             self.rate = ExchangeRate(self.market, rate, int(time.time()))
             self.last_check = time.time()
+            self._consecutive_failures = 0
+            self._last_failure_signature = None
             return self.rate
         except asyncio.TimeoutError:
-            log.warning("Timed out fetching exchange rate from %s.", self.name)
+            self._record_failure("Timed out fetching exchange rate from %s.", self.name)
         except json.JSONDecodeError as e:
             msg = e.doc if '<html>' not in e.doc else 'unexpected content type.'
-            log.warning("Could not parse exchange rate response from %s: %s", self.name, msg)
+            self._record_failure("Could not parse exchange rate response from %s: %s", self.name, msg)
             log.debug(e.doc)
         except InvalidExchangeRateResponseError as e:
-            log.warning(str(e))
+            self._record_failure(str(e))
         except ClientConnectionError as e:
-            log.warning("Error trying to connect to exchange rate %s: %s", self.name, str(e))
+            self._record_failure("Error trying to connect to exchange rate %s: %s", self.name, str(e))
         except Exception as e:
-            log.exception("Exchange rate error (%s from %s):", self.market, self.name)
+            failure_count = self._record_failure(
+                "Unexpected exchange rate error from %s: %s", self.name, str(e)
+            )
+            if failure_count == 1:
+                log.debug("Full traceback for exchange rate error from %s", self.name, exc_info=True)
         finally:
             self.event.set()
 
@@ -109,94 +117,68 @@ class MarketFeed:
             self._task.cancel()
         self._task = None
         self.event.clear()
+        self._consecutive_failures = 0
+        self._last_failure_signature = None
+
+    def _record_failure(self, message: str, *args) -> int:
+        signature = message % args if args else message
+        if signature != self._last_failure_signature:
+            self._consecutive_failures = 0
+            self._last_failure_signature = signature
+        self._consecutive_failures += 1
+        formatted = signature
+
+        if self._consecutive_failures == 1:
+            log.debug("Exchange rate feed offline: %s", formatted)
+            return self._consecutive_failures
+
+        if self._consecutive_failures in (5, 15, 30, 60):
+            log.debug("Exchange rate feed still offline: %s (repeat #%d)", formatted, self._consecutive_failures)
+        else:
+            log.debug("%s (repeat #%d)", formatted, self._consecutive_failures)
+        return self._consecutive_failures
 
 
-class BaseBittrexFeed(MarketFeed):
-    name = "Bittrex"
-    market = None
-    url = None
-    fee = 0.0025
-
-    def get_rate_from_response(self, json_response):
-        if 'lastTradeRate' not in json_response:
-            raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response['lastTradeRate'])
-
-
-class BittrexBTCFeed(BaseBittrexFeed):
-    market = "BTCLBC"
-    url = "https://api.bittrex.com/v3/markets/LBC-BTC/ticker"
-
-
-class BittrexUSDFeed(BaseBittrexFeed):
+class MEXCFeed(MarketFeed):
+    name = "MEXC"
     market = "USDLBC"
-    url = "https://api.bittrex.com/v3/markets/LBC-USD/ticker"
-
-
-class BaseCoinExFeed(MarketFeed):
-    name = "CoinEx"
-    market = None
-    url = None
+    url = "https://api.mexc.com/api/v3/ticker/price"
+    params = {"symbol": "LBCUSDT"}
 
     def get_rate_from_response(self, json_response):
-        if 'data' not in json_response or \
-           'ticker' not in json_response['data'] or \
-           'last' not in json_response['data']['ticker']:
+        if 'price' not in json_response:
             raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response['data']['ticker']['last'])
+        return 1.0 / float(json_response['price'])
 
 
-class CoinExBTCFeed(BaseCoinExFeed):
-    market = "BTCLBC"
-    url = "https://api.coinex.com/v1/market/ticker?market=LBCBTC"
-
-
-class CoinExUSDFeed(BaseCoinExFeed):
+class CoinGeckoUSDFeed(MarketFeed):
+    name = "CoinGecko"
     market = "USDLBC"
-    url = "https://api.coinex.com/v1/market/ticker?market=LBCUSDT"
-
-
-class BaseHotbitFeed(MarketFeed):
-    name = "hotbit"
-    market = None
-    url = "https://api.hotbit.io/api/v1/market.last"
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "lbry-credits", "vs_currencies": "usd"}
 
     def get_rate_from_response(self, json_response):
-        if 'result' not in json_response:
+        if 'lbry-credits' not in json_response or 'usd' not in json_response['lbry-credits']:
             raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response['result'])
+        return 1.0 / float(json_response['lbry-credits']['usd'])
 
 
-class HotbitBTCFeed(BaseHotbitFeed):
+class CoinGeckoBTCFeed(MarketFeed):
+    name = "CoinGecko"
     market = "BTCLBC"
-    params = {"market": "LBC/BTC"}
-
-
-class HotbitUSDFeed(BaseHotbitFeed):
-    market = "USDLBC"
-    params = {"market": "LBC/USDT"}
-
-
-class UPbitBTCFeed(MarketFeed):
-    name = "UPbit"
-    market = "BTCLBC"
-    url = "https://api.upbit.com/v1/ticker"
-    params = {"markets": "BTC-LBC"}
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "lbry-credits", "vs_currencies": "btc"}
 
     def get_rate_from_response(self, json_response):
-        if "error" in json_response or len(json_response) != 1 or 'trade_price' not in json_response[0]:
+        if 'lbry-credits' not in json_response or 'btc' not in json_response['lbry-credits']:
             raise InvalidExchangeRateResponseError(self.name, 'result not found')
-        return 1.0 / float(json_response[0]['trade_price'])
+        return 1.0 / float(json_response['lbry-credits']['btc'])
 
 
 FEEDS: Iterable[Type[MarketFeed]] = (
-    BittrexBTCFeed,
-    BittrexUSDFeed,
-    CoinExBTCFeed,
-    CoinExUSDFeed,
-#    HotbitBTCFeed,
-#    HotbitUSDFeed,
-#    UPbitBTCFeed,
+    MEXCFeed,
+    CoinGeckoUSDFeed,
+    CoinGeckoBTCFeed,
 )
 
 
@@ -205,9 +187,7 @@ class ExchangeRateManager:
         self.market_feeds = [Feed() for Feed in feeds]
 
     def wait(self):
-        return asyncio.wait(
-            [feed.event.wait() for feed in self.market_feeds],
-        )
+        return asyncio.gather(*(feed.event.wait() for feed in self.market_feeds))
 
     def start(self):
         log.info("Starting exchange rate manager")

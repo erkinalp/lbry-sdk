@@ -281,7 +281,11 @@ class BlobBuffer(AbstractBlob):
             if self._verified_bytes:
                 raise OSError("already have bytes for blob")
             self._verified_bytes = BytesIO(blob_bytes)
-        return self.loop.create_task(write())
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self.loop
+        return loop.create_task(write())
 
     def delete(self):
         if self._verified_bytes:
@@ -344,9 +348,13 @@ class BlobFile(AbstractBlob):
                 f.write(blob_bytes)
 
         async def write_blob():
-            await self.loop.run_in_executor(None, _write_blob)
+            await asyncio.get_running_loop().run_in_executor(None, _write_blob)
 
-        return self.loop.create_task(write_blob())
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self.loop
+        return loop.create_task(write_blob())
 
     def delete(self):
         super().delete()

@@ -4,7 +4,7 @@ LBRY is a decentralized peer-to-peer protocol for publishing and accessing digit
 
 LBRY SDK for Python is currently the most fully featured implementation of the LBRY Network protocols and includes many useful components and tools for building decentralized applications. Primary features and components include:
 
- * Built on Python 3.7 and `asyncio`.
+ * Built on Python 3.14+ and `asyncio`.
  * Kademlia DHT (Distributed Hash Table) implementation for finding peers to download from and announcing to peers what we have to host ([lbry.dht](https://github.com/lbryio/lbry-sdk/tree/master/lbry/dht)).
  * Blob exchange protocol for transferring encrypted blobs of content and negotiating payments ([lbry.blob_exchange](https://github.com/lbryio/lbry-sdk/tree/master/lbry/blob_exchange)).
  * Protobuf schema for encoding and decoding metadata stored on the blockchain ([lbry.schema](https://github.com/lbryio/lbry-sdk/tree/master/lbry/schema)).
@@ -54,3 +54,16 @@ The documentation for the API can be found [here](https://lbry.tech/api/sdk).
 Daemon defaults, ports, and other settings are documented [here](https://lbry.tech/resources/daemon-settings).
 
 Settings can be configured using a daemon-settings.yml file. An example can be found [here](https://github.com/lbryio/lbry-sdk/blob/master/example_daemon_settings.yml).
+
+## Troubleshooting
+
+### Error: unsupported hash type 'ripemd160'
+
+If you see this error when running `lbrynet start`, it likely means your OpenSSL or Python installation is missing RIPEMD160 support.
+
+To fix it:
+
+- Ensure you are using a version of Python compiled with OpenSSL support.
+- On Ubuntu/Debian, try: `sudo apt install libssl-dev` and reinstall Python.
+- Alternatively, use a precompiled Python version (e.g., via `pyenv install 3.8.18` after `libssl-dev` is installed).
+
