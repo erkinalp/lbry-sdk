@@ -73,7 +73,7 @@ class StreamDownloader:
                 self._cancelled_tasks.discard(t)
 
         self._cancelled_tasks.add(task)
-        self.loop.create_task(_await_task(task))
+        asyncio.get_running_loop().create_task(_await_task(task))
 
     async def add_fixed_peers(self):
         def _add_fixed_peers(fixed_peers):
@@ -165,7 +165,7 @@ class StreamDownloader:
                 continue
             blob_info = self.descriptor.blobs[idx]
             high_priority = idx == current_index + 1
-            self._prefetch_jobs[idx] = self.loop.create_task(
+            self._prefetch_jobs[idx] = asyncio.get_running_loop().create_task(
                 self._prefetch_blob(idx, blob_info, high_priority=high_priority)
             )
 
@@ -205,7 +205,7 @@ class StreamDownloader:
                         await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     return
-            self._progress_task = self.loop.create_task(_heartbeat())
+            self._progress_task = asyncio.get_running_loop().create_task(_heartbeat())
 
         if not self.descriptor:
             await self.load_descriptor(connection_id)

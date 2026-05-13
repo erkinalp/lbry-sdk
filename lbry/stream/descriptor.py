@@ -214,7 +214,8 @@ class StreamDescriptor:
                                           blob: AbstractBlob) -> 'StreamDescriptor':
         if not blob.is_readable():
             raise InvalidStreamDescriptorError(f"unreadable/missing blob: {blob.blob_hash}")
-        return await loop.run_in_executor(None, cls._from_stream_descriptor_blob, loop, blob_dir, blob)
+        running_loop = asyncio.get_running_loop()
+        return await running_loop.run_in_executor(None, cls._from_stream_descriptor_blob, loop, blob_dir, blob)
 
     @staticmethod
     def get_blob_hashsum(blob_dict: typing.Dict):

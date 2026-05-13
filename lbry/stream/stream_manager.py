@@ -67,7 +67,8 @@ class StreamManager(SourceManager):
             async with sem:
                 return await coro
 
-        tasks = [self.loop.create_task(_runner(c)) for c in coros]
+        running_loop = asyncio.get_running_loop()
+        tasks = [running_loop.create_task(_runner(c)) for c in coros]
         if tasks:
             return await asyncio.gather(*tasks)
         return []
@@ -213,7 +214,7 @@ class StreamManager(SourceManager):
 
     async def start(self):
         await super().start()
-        self.re_reflect_task = self.loop.create_task(self.reflect_streams())
+        self.re_reflect_task = asyncio.get_running_loop().create_task(self.reflect_streams())
 
     async def stop(self):
         await super().stop()
@@ -235,7 +236,7 @@ class StreamManager(SourceManager):
             server, port = random.choice(self.config.reflector_servers)
         if stream.sd_hash in self.running_reflector_uploads:
             return self.running_reflector_uploads[stream.sd_hash]
-        task = self.loop.create_task(self._retriable_reflect_stream(stream, server, port))
+        task = asyncio.get_running_loop().create_task(self._retriable_reflect_stream(stream, server, port))
         self.running_reflector_uploads[stream.sd_hash] = task
         task.add_done_callback(
             lambda _: None if stream.sd_hash not in self.running_reflector_uploads else
