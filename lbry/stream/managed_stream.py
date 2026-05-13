@@ -240,8 +240,8 @@ class ManagedStream(ManagedDownloadSource):
                 if response._eof_sent:
                     break
             return response
-        except (ConnectionResetError, ConnectionError):
-            log.debug("connection was closed after sending browser %i blob bytes", wrote)
+        except ConnectionResetError:
+            log.warning("connection was reset after sending browser %i blob bytes", wrote)
             raise asyncio.CancelledError("range request transport was reset")
         finally:
             response.force_close()
