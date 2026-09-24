@@ -53,7 +53,7 @@ from lbry.extras.daemon.componentmanager import RequiredCondition
 from lbry.extras.daemon.componentmanager import ComponentManager
 from lbry.extras.daemon.json_response_encoder import JSONResponseEncoder
 from lbry.extras.daemon.undecorated import undecorated
-from lbry.extras.daemon.security import ensure_request_allowed, is_api_binding_safe, is_loopback_host
+from lbry.extras.daemon.security import ensure_request_allowed
 from lbry.file_analysis import VideoFileAnalyzer
 from lbry.schema.claim import Claim
 from lbry.schema.url import URL
@@ -492,19 +492,6 @@ class Daemon(metaclass=JSONRPCServerType):
         log.info("Starting LBRYNet Daemon")
         log.debug("Settings: %s", json.dumps(self.conf.settings_dict, indent=2))
         log.info("Platform: %s", json.dumps(self.platform_info, indent=2))
-
-        if not is_api_binding_safe(self.conf):
-            log.error(
-                "Refusing to start: the unauthenticated API is bound to non-loopback address '%s' "
-                "with allowed_origin='*'. Bind 'api' to localhost or set 'allowed_origin' to an "
-                "explicit origin.", self.conf.api_host
-            )
-            raise SystemExit()
-        if not is_loopback_host(self.conf.api_host):
-            log.warning(
-                "The API has no authentication and is bound to non-loopback address '%s'; "
-                "anyone who can reach it can control the daemon and wallet.", self.conf.api_host
-            )
 
         await self.analytics_manager.send_server_startup()
         await self.rpc_runner.setup()
