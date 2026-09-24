@@ -2,8 +2,6 @@ version: '3'
 services:
     websdk:
         image: vshyba/websdk
-        ports:
-            - '5279:5279'
-            - '5280:5280'
+        network_mode: host
         volumes:
             - ./webconf.yaml:/webconf.yaml

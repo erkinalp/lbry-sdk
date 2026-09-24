@@ -1,7 +1,21 @@
+import ipaddress
 import logging
 from aiohttp import web
 
 log = logging.getLogger(__name__)
+
+
+def is_loopback_host(host: str) -> bool:
+    if host.lower() == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(host.strip('[]')).is_loopback
+    except ValueError:
+        return False
+
+
+def is_api_binding_safe(conf) -> bool:
+    return conf.allowed_origin != '*' or is_loopback_host(conf.api_host)
 
 
 def ensure_request_allowed(request, conf):
