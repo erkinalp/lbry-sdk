@@ -1,9 +1,8 @@
-allowed_origin: "*"
 max_key_fee: "0.0 USD"
 save_files: false
 save_blobs: false
-streaming_server: "0.0.0.0:5280"
-api: "0.0.0.0:5279"
+streaming_server: "localhost:5280"
+api: "localhost:5279"
 data_dir: /tmp
 download_dir: /tmp
 wallet_dir: /tmp
