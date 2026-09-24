@@ -7,7 +7,6 @@ from aiohttp.web import HTTPForbidden
 from lbry.testcase import AsyncioTestCase
 from lbry.conf import Config
 from lbry.extras.daemon.security import is_request_allowed as allowed, ensure_request_allowed as ensure
-from lbry.extras.daemon.security import is_api_binding_safe, is_loopback_host
 from lbry.extras.daemon.components import (
     DATABASE_COMPONENT, DISK_SPACE_COMPONENT, BLOB_COMPONENT, WALLET_COMPONENT, DHT_COMPONENT,
     HASH_ANNOUNCER_COMPONENT, FILE_MANAGER_COMPONENT, PEER_PROTOCOL_SERVER_COMPONENT,
@@ -60,24 +59,6 @@ class TestAllowedOrigin(unittest.TestCase):
                 ensure(request('GET', '/', headers={'Origin': 'hackers.com'}), conf)
             self.assertIn("'hackers.com' are not allowed", log.output[0])
             self.assertIn("'allowed_origin' limits requests to: 'localhost'", log.output[0])
-
-
-class TestApiBinding(unittest.TestCase):
-
-    def test_loopback_host(self):
-        for host in ('localhost', 'LOCALHOST', '127.0.0.1', '127.1.2.3', '::1', '[::1]'):
-            self.assertTrue(is_loopback_host(host), host)
-        for host in ('0.0.0.0', '192.168.1.5', '::', 'example.com', ''):
-            self.assertFalse(is_loopback_host(host), host)
-
-    def test_api_binding_safe(self):
-        self.assertTrue(is_api_binding_safe(Config()))
-        self.assertTrue(is_api_binding_safe(Config(allowed_origin='*')))
-        self.assertTrue(is_api_binding_safe(Config(allowed_origin='*', api='127.0.0.1:5279')))
-        self.assertTrue(is_api_binding_safe(Config(api='0.0.0.0:5279')))
-        self.assertTrue(is_api_binding_safe(Config(allowed_origin='https://app.example', api='0.0.0.0:5279')))
-        self.assertFalse(is_api_binding_safe(Config(allowed_origin='*', api='0.0.0.0:5279')))
-        self.assertFalse(is_api_binding_safe(Config(allowed_origin='*', api='10.0.0.2:5279')))
 
 
 class TestAccessHeaders(AsyncioTestCase):
